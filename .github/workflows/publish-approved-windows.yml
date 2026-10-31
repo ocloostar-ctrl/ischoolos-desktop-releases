@@ -1,0 +1,76 @@
+name: Publish approved Windows 1.0.1
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_url:
+        description: Temporary download URL for the approved Windows build artifact
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download the approved binary artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const url = context.payload.inputs.artifact_url;
+            core.setSecret(url);
+            const parsed = new URL(url);
+            if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.blob.core.windows.net')) throw Error('Unexpected artifact host');
+            const response = await fetch(url, {redirect:'error'});
+            if (!response.ok) throw Error('Approved artifact download failed: ' + response.status);
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'approved-desktop.zip'), Buffer.from(await response.arrayBuffer()));
+      - name: Verify exact filenames and pinned checksums before extraction
+        shell: python
+        run: |
+          import os, pathlib, hashlib, zipfile
+          expected = {"iSchoolOS-Setup-1.0.1-x64.exe": "37142687f249e0a7b452aeac0ed9b26ec3b0b65b2284516e4d1972e7c9e1a734", "iSchoolOS-Portable-1.0.1-x64.exe": "458498c3e34f702ba3be3e4d2fb9734fe1af4a88cb0e54d3b9388a6b89f817bc", "iSchoolOS-Setup-1.0.1-x64.exe.blockmap": "4f2592058ba14ffd3de910a61bad830a9c3f276b0192927ea8bf5b71dbb492d0", "latest.yml": "e997b8d4dc1a0b33e9e848844b9596b7819f66a939dffa6cfcbddcc268bfdf3c", "SHA256SUMS.txt": "8158a854d5ff0e1fe2109f84c3dd254875b1387a8dee7973f6d7b628011ec940"}
+          folder = pathlib.Path('desktop-release')
+          folder.mkdir()
+          with zipfile.ZipFile(pathlib.Path(os.environ['RUNNER_TEMP']) / 'approved-desktop.zip') as archive:
+              names = archive.namelist()
+              if len(names) != len(expected) or set(names) != set(expected):
+                  raise RuntimeError('Unexpected files in the approved artifact')
+              for name, digest in expected.items():
+                  info = archive.getinfo(name)
+                  if info.file_size > 200 * 1024 * 1024:
+                      raise RuntimeError('Unexpected artifact size')
+                  h = hashlib.sha256()
+                  with archive.open(name) as source, (folder / name).open('wb') as target:
+                      for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                          h.update(chunk)
+                          target.write(chunk)
+                  if h.hexdigest() != digest:
+                      raise RuntimeError('Approved checksum mismatch: ' + name)
+          print('Verified all five approved release files.')
+      - name: Upload and publish the approved binary-only release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const expected = {"iSchoolOS-Setup-1.0.1-x64.exe": "37142687f249e0a7b452aeac0ed9b26ec3b0b65b2284516e4d1972e7c9e1a734", "iSchoolOS-Portable-1.0.1-x64.exe": "458498c3e34f702ba3be3e4d2fb9734fe1af4a88cb0e54d3b9388a6b89f817bc", "iSchoolOS-Setup-1.0.1-x64.exe.blockmap": "4f2592058ba14ffd3de910a61bad830a9c3f276b0192927ea8bf5b71dbb492d0", "latest.yml": "e997b8d4dc1a0b33e9e848844b9596b7819f66a939dffa6cfcbddcc268bfdf3c", "SHA256SUMS.txt": "8158a854d5ff0e1fe2109f84c3dd254875b1387a8dee7973f6d7b628011ec940"};
+            const notes = "iSchoolOS for Windows 1.0.1 adds desktop update checks.\n\n- Setup installer: install this version once to enable future desktop updates. Updates download in the background and install when you close iSchoolOS. Finish unsaved forms before restarting. Use Help \u2192 Check for desktop updates for a manual check.\n- Portable EXE: update notifications open the downloads page. Close the app, replace the EXE and keep the iSchoolOS Data folder.\n- Both formats use the school server and normal account sign-in. General work currently needs a network connection. Broader offline record capture and financial synchronization are under development and are not enabled by this package alone.\n- Packages are unsigned; Windows may show an unknown-publisher notice.\n\nThe downloads contain no school database, account password or provider key. This release repository distributes desktop packages and update metadata; the application's source repository remains private.\n\nSHA256SUMS.txt contains checksums for both EXEs. latest.yml and the installer blockmap support automatic updates.\n";
+            const {owner, repo} = context.repo;
+            let release;
+            try { release = (await github.rest.repos.getReleaseByTag({owner,repo,tag:'v1.0.1'})).data; }
+            catch (error) { if (error.status !== 404) throw error; }
+            if (!release) release = (await github.rest.repos.createRelease({owner,repo,tag_name:'v1.0.1',target_commitish:'main',name:'iSchoolOS for Windows 1.0.1',body:notes,draft:true,prerelease:false})).data;
+            if (!release.draft) throw Error('This version is already published; refusing to replace it.');
+            const old = (await github.rest.repos.listReleaseAssets({owner,repo,release_id:release.id,per_page:100})).data;
+            for (const name of Object.keys(expected)) {
+              for (const asset of old.filter(a=>a.name===name)) await github.rest.repos.deleteReleaseAsset({owner,repo,asset_id:asset.id});
+              const data = fs.readFileSync('desktop-release/'+name);
+              const result = await github.rest.repos.uploadReleaseAsset({owner,repo,release_id:release.id,name,data,headers:{'content-type':'application/octet-stream','content-length':data.length}});
+              if (result.data.size !== data.length || result.data.state !== 'uploaded') throw Error('Upload not confirmed: '+name);
+              if (result.data.digest && result.data.digest !== 'sha256:'+expected[name]) throw Error('GitHub asset checksum mismatch: '+name);
+            }
+            const assets = (await github.rest.repos.listReleaseAssets({owner,repo,release_id:release.id,per_page:100})).data;
+            if (assets.length !== Object.keys(expected).length || assets.some(a=>!expected[a.name]||a.state!=='uploaded')) throw Error('Incomplete release; keeping draft.');
+            await github.rest.repos.updateRelease({owner,repo,release_id:release.id,draft:false,prerelease:false,make_latest:'true',body:notes});
+            core.info('Published verified iSchoolOS Windows 1.0.1 packages.');
